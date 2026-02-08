@@ -261,15 +261,22 @@ def claude_code(
                     # raise for error
                     if not result.success:
                         # see if this is a timeout and we are retrying timeouts
+                        # check both stdout and stderr (not just stderr)
+                        combined_output = result.stdout + result.stderr
+
+                        # Log output for debugging timeout detection when retry_timeouts is enabled
+                        if retry_timeouts is not None:
+                            trace(f"Agent execution failed. Checking for timeout patterns in stdout ({len(result.stdout)} chars) and stderr ({len(result.stderr)} chars).\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+
                         if (
-                            "request timed out" in result.stderr.lower()
+                            "request timed out" in combined_output.lower()
                             and retry_timeouts is not None
                             and timeout_count < retry_timeouts
                         ):
                             timeout_count += 1
                             delay = min(2**timeout_count, 60)
                             trace(
-                                f"Retrying timed out request (retry {timeout_count}, waiting {delay} seconds)."
+                                f"Detected timeout. Retrying timed out request (retry {timeout_count}/{retry_timeouts}, waiting {delay} seconds)."
                             )
                             await anyio.sleep(delay)
                             continue
