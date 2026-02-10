@@ -268,8 +268,12 @@ def claude_code(
                         if retry_timeouts is not None:
                             trace(f"Agent execution failed. Checking for timeout patterns in stdout ({len(result.stdout)} chars) and stderr ({len(result.stderr)} chars).\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
 
-                        if (
+                        is_timeout = (
                             "request timed out" in combined_output.lower()
+                            or "pre-flight check is taking longer than expected" in combined_output.lower()
+                        )
+                        if (
+                            is_timeout
                             and retry_timeouts is not None
                             and timeout_count < retry_timeouts
                         ):
