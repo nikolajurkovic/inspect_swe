@@ -2,7 +2,7 @@ import shlex
 import uuid
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import anyio
 from inspect_ai.agent import (
@@ -31,6 +31,15 @@ from .._util.trace import trace
 from .agentbinary import claude_code_binary_source
 
 
+def _default_should_retry(stdout: str, stderr: str) -> bool:
+    """Default error checker for retry_errors. Looks for timeout and slow pre-flight errors."""
+    combined = (stdout + stderr).lower()
+    return (
+        "request timed out" in combined
+        or "pre-flight check is taking longer than expected" in combined
+    )
+
+
 @agent
 def claude_code(
     name: str = "Claude Code",
@@ -52,7 +61,7 @@ def claude_code(
     subagent_model: str | None = None,
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
-    retry_timeouts: int | None = None,
+    retry_errors: int | tuple[int, Callable[[str, str], bool]] | None = None,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     user: str | None = None,
@@ -89,7 +98,10 @@ def claude_code(
         subagent_model: The model to use for [subagents](https://code.claude.com/docs/en/sub-agents). Defaults to `model`.
         filter: Filter for intercepting bridged model requests.
         retry_refusals: Should refusals be retried? (pass number of times to retry)
-        retry_timeouts: Should timeouts be retried? (pass number of times to retry)
+        retry_errors: Retry on errors. Pass an `int` to retry up to that many times
+            using the default error checker (matches timeout and slow pre-flight errors),
+            or a `tuple[int, Callable[[str, str], bool]]` with a custom callable that
+            receives `(stdout, stderr)` and returns `True` if the error should be retried.
         cwd: Working directory to run claude code within.
         env: Environment variables to set for claude code.
         user: User to execute claude code with.
@@ -221,14 +233,24 @@ def claude_code(
                     state=state,
                 )
             else:
+                # resolve retry_errors
+                if isinstance(retry_errors, int):
+                    max_retries = retry_errors
+                    should_retry = _default_should_retry
+                elif isinstance(retry_errors, tuple):
+                    max_retries, should_retry = retry_errors
+                else:
+                    max_retries = 0
+                    should_retry = None
+
                 # execute the agent (track debug output)
                 debug_output: list[str] = []
                 agent_prompt = prompt
                 attempt_count = 0
-                timeout_count = 0
+                error_retry_count = 0
                 while True:
                     # resume previous conversation
-                    if has_assistant_response or attempt_count > 0 or timeout_count > 0:
+                    if has_assistant_response or attempt_count > 0 or error_retry_count > 0:
                         agent_cmd = (
                             [claude_binary, "--continue"] + cmd + ["--", agent_prompt]
                         )
@@ -254,17 +276,15 @@ def claude_code(
 
                     # raise for error
                     if not result.success:
-                        # see if this is a timeout and we are retrying timeouts
                         if (
-                            "request timed out"
-                            in (result.stdout.lower() + result.stderr.lower())
-                            and retry_timeouts is not None
-                            and timeout_count < retry_timeouts
+                            should_retry is not None
+                            and should_retry(result.stdout, result.stderr)
+                            and error_retry_count < max_retries
                         ):
-                            timeout_count += 1
-                            delay = min(2**timeout_count, 60)
+                            error_retry_count += 1
+                            delay = min(2**error_retry_count, 60)
                             trace(
-                                f"Retrying timed out request (retry {timeout_count}, waiting {delay} seconds)."
+                                f"Retryable error detected. Retrying request (retry {error_retry_count}/{max_retries}, waiting {delay} seconds)."
                             )
                             await anyio.sleep(delay)
                             continue
@@ -273,8 +293,8 @@ def claude_code(
                             f"Error executing claude code agent: {result.stdout}\n{result.stderr}"
                         )
 
-                    # reset timeout counter
-                    timeout_count = 0
+                    # reset error retry counter
+                    error_retry_count = 0
 
                     # exit if we are at max_attempts
                     attempt_count += 1
